@@ -27,6 +27,7 @@ import {
   mergeTransportHeaders,
   sanitizeTransportPayloadText,
 } from "./transport-stream-shared.js";
+import { logModelError, logModelRequest, logModelResponse } from "./transport-logging.js";
 
 const CLAUDE_CODE_VERSION = "2.1.75";
 const CLAUDE_CODE_TOOLS = [
@@ -664,6 +665,20 @@ export function createAnthropicMessagesTransportStreamFn(): StreamFn {
         if (nextParams !== undefined) {
           params = nextParams as Record<string, unknown>;
         }
+        // Log request before sending to API
+        const requestStartTime = Date.now();
+        logModelRequest({
+          model: model.id,
+          provider: "anthropic",
+          messages: (params.messages as Array<{ role: string; content: unknown }>) || [],
+          systemPrompt: typeof params.system === "string" ? params.system : undefined,
+          tools: (params.tools as Array<{ name: string }>) || [],
+          maxTokens: typeof params.max_tokens === "number" ? params.max_tokens : undefined,
+          thinking:
+            params.thinking && typeof params.thinking === "object"
+              ? (params.thinking as Record<string, unknown>)
+              : null,
+        });
         const anthropicStream = client.messages.stream(
           { ...params, stream: true } as never,
           transportOptions.signal ? { signal: transportOptions.signal } : undefined,
@@ -884,8 +899,45 @@ export function createAnthropicMessagesTransportStreamFn(): StreamFn {
             calculateCost(model, output.usage);
           }
         }
+        // Log response after streaming completes
+        const responseDuration = Date.now() - requestStartTime;
+        const toolCalls = output.content
+          .filter((block) => block.type === "toolCall")
+          .map((block) => ({
+            name: (block as { name: string }).name,
+            id: (block as { id: string }).id,
+          }));
+        logModelResponse({
+          model: model.id,
+          provider: "anthropic",
+          duration: responseDuration,
+          stopReason: output.stopReason,
+          inputTokens: output.usage.input,
+          outputTokens: output.usage.output,
+          cacheReadTokens: output.usage.cacheRead,
+          cacheWriteTokens: output.usage.cacheWrite,
+          cost: output.usage.cost as {
+            input: number;
+            output: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+            total: number;
+          },
+          toolCalls,
+          responseContent:
+            output.content.length > 0 && output.content[0].type === "text"
+              ? (output.content[0] as { text: string }).text
+              : undefined,
+        });
         finalizeTransportStream({ stream, output, signal: transportOptions.signal });
       } catch (error) {
+        const errorDuration = Date.now() - requestStartTime;
+        logModelError({
+          model: model.id,
+          provider: "anthropic",
+          error: error instanceof Error ? error : new Error(String(error)),
+          duration: errorDuration,
+        });
         failTransportStream({
           stream,
           output,
